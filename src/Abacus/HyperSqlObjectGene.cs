@@ -227,10 +227,16 @@ public class HyperSqlObjectGene : HyperSqlObject
                 while (reader.Read()) toDelete.Add((reader.GetString(0), reader.GetString(1)));
                 reader.Close();
 
-                using var tx = conn.BeginTransaction();
+                using var delCmd = conn.CreateCommand();
+                delCmd.CommandText = "DELETE FROM geneXML WHERE tag = @tag AND geneid = @gid";
+                var pTag = delCmd.Parameters.Add("@tag", SqliteType.Text);
+                var pGid = delCmd.Parameters.Add("@gid", SqliteType.Text);
+                using var tx = BeginTransaction(conn, delCmd);
                 foreach (var (tag, gid) in toDelete)
                 {
-                    Exec(conn, $"DELETE FROM geneXML WHERE tag = '{tag}' AND geneid = '{gid}'");
+                    pTag.Value = tag;
+                    pGid.Value = gid;
+                    delCmd.ExecuteNonQuery();
                 }
                 tx.Commit();
             }
@@ -337,20 +343,50 @@ public class HyperSqlObjectGene : HyperSqlObject
         reader.Close();
 
         var iter = 0;
-        using (var tx = conn.BeginTransaction())
+        using (var numXmlCmd = conn.CreateCommand())
+        using (var updCmd = conn.CreateCommand())
         {
+            numXmlCmd.CommandText = "SELECT COUNT(DISTINCT tag) FROM geneXML WHERE geneid = @geneid";
+            var pNumXmlGeneid = numXmlCmd.Parameters.Add("@geneid", SqliteType.Text);
+
+            // Merges the original's 3 separate per-gene UPDATEs (numXML, then
+            // numSpecsTot/Uniq, then numPepsTot/Uniq) into one, since all 5
+            // values are already fully computed in C# before any of them need
+            // to be written - no reason to round-trip 3 times instead of 1.
+            updCmd.CommandText = """
+                UPDATE geneidSummary
+                  SET numXML = @numXml,
+                      numSpecsTot = @numSpecsTot,
+                      numSpecsUniq = @numSpecsUniq,
+                      numPepsTot = @numPepsTot,
+                      numPepsUniq = @numPepsUniq
+                WHERE geneid = @geneid
+                """;
+            var pUpdNumXml = updCmd.Parameters.Add("@numXml", SqliteType.Integer);
+            var pUpdNumSpecsTot = updCmd.Parameters.Add("@numSpecsTot", SqliteType.Integer);
+            var pUpdNumSpecsUniq = updCmd.Parameters.Add("@numSpecsUniq", SqliteType.Integer);
+            var pUpdNumPepsTot = updCmd.Parameters.Add("@numPepsTot", SqliteType.Integer);
+            var pUpdNumPepsUniq = updCmd.Parameters.Add("@numPepsUniq", SqliteType.Integer);
+            var pUpdGeneid = updCmd.Parameters.Add("@geneid", SqliteType.Text);
+
+            using var tx = BeginTransaction(conn, numXmlCmd, updCmd);
             foreach (var geneid in geneids)
             {
-                var numXml = ExecScalarInt(conn, $"SELECT COUNT(DISTINCT tag) FROM geneXML WHERE geneid = '{geneid}'");
-                Exec(conn, $"UPDATE geneidSummary SET numXML = {numXml} WHERE geneid = '{geneid}'");
+                pNumXmlGeneid.Value = geneid;
+                var numXml = Convert.ToInt32(numXmlCmd.ExecuteScalar());
 
                 var nspecsTot = GetNumSpecsGc(geneid, CombinedFile!, conn, 0.0);
                 var nspecsUniq = GetNumSpecsGc(geneid, CombinedFile!, conn, WtTh);
-                Exec(conn, $"UPDATE geneidSummary SET numSpecsTot = {nspecsTot}, numSpecsUniq = {nspecsUniq} WHERE geneid = '{geneid}'");
-
                 var npepsTot = GetNumPepsGc(geneid, CombinedFile!, conn, 0.0);
                 var npepsUniq = GetNumPepsGc(geneid, CombinedFile!, conn, WtTh);
-                Exec(conn, $"UPDATE geneidSummary SET numPepsTot = {npepsTot}, numPepsUniq = {npepsUniq} WHERE geneid = '{geneid}'");
+
+                pUpdNumXml.Value = numXml;
+                pUpdNumSpecsTot.Value = nspecsTot;
+                pUpdNumSpecsUniq.Value = nspecsUniq;
+                pUpdNumPepsTot.Value = npepsTot;
+                pUpdNumPepsUniq.Value = npepsUniq;
+                pUpdGeneid.Value = geneid;
+                updCmd.ExecuteNonQuery();
 
                 if (console == null) Globals.CursorStatus(iter, msg);
                 iter++;
@@ -642,26 +678,48 @@ public class HyperSqlObjectGene : HyperSqlObject
                 reader.Close();
 
                 var iter = 0;
-                using (var tx = conn.BeginTransaction())
+                using (var updCmd = conn.CreateCommand())
                 {
+                    // Merges the original's 2 separate per-gene UPDATEs into 1 -
+                    // all 7 values are already fully computed in C# before
+                    // either needs to be written.
+                    updCmd.CommandText = $"""
+                        UPDATE geneResults
+                          SET {tag}_maxPw = @maxPw,
+                              {tag}_max_localPw = @maxLocalPw,
+                              {tag}_maxIniProb = @maxIniProb,
+                              {tag}_numSpecsTot = @numSpecsTot,
+                              {tag}_numSpecsUniq = @numSpecsUniq,
+                              {tag}_numPepsTot = @numPepsTot,
+                              {tag}_numPepsUniq = @numPepsUniq
+                        WHERE geneid = @geneid
+                        """;
+                    var pMaxPw = updCmd.Parameters.Add("@maxPw", SqliteType.Real);
+                    var pMaxLocalPw = updCmd.Parameters.Add("@maxLocalPw", SqliteType.Real);
+                    var pMaxIniProb = updCmd.Parameters.Add("@maxIniProb", SqliteType.Real);
+                    var pNumSpecsTot = updCmd.Parameters.Add("@numSpecsTot", SqliteType.Integer);
+                    var pNumSpecsUniq = updCmd.Parameters.Add("@numSpecsUniq", SqliteType.Integer);
+                    var pNumPepsTot = updCmd.Parameters.Add("@numPepsTot", SqliteType.Integer);
+                    var pNumPepsUniq = updCmd.Parameters.Add("@numPepsUniq", SqliteType.Integer);
+                    var pGeneid = updCmd.Parameters.Add("@geneid", SqliteType.Text);
+
+                    using var tx = BeginTransaction(conn, updCmd);
                     foreach (var (geneid, maxPw, maxLocalPw, maxIniProb) in rows)
                     {
-                        Exec(conn, $"""
-                            UPDATE geneResults
-                              SET ({tag}_maxPw, {tag}_max_localPw, {tag}_maxIniProb) = ({maxPw}, {maxLocalPw}, {maxIniProb})
-                            WHERE geneid = '{geneid}'
-                            """);
-
                         var nsT = GetNumSpecsGc(geneid, tag, conn, 0);
                         var nsU = GetNumSpecsGc(geneid, tag, conn, WtTh);
                         var npT = GetNumPepsGc(geneid, tag, conn, 0);
                         var npU = GetNumPepsGc(geneid, tag, conn, WtTh);
 
-                        Exec(conn, $"""
-                            UPDATE geneResults
-                              SET ({tag}_numSpecsTot, {tag}_numSpecsUniq, {tag}_numPepsTot, {tag}_numPepsUniq) = ({nsT}, {nsU}, {npT}, {npU})
-                            WHERE geneid = '{geneid}'
-                            """);
+                        pMaxPw.Value = maxPw;
+                        pMaxLocalPw.Value = maxLocalPw;
+                        pMaxIniProb.Value = maxIniProb;
+                        pNumSpecsTot.Value = nsT;
+                        pNumSpecsUniq.Value = nsU;
+                        pNumPepsTot.Value = npT;
+                        pNumPepsUniq.Value = npU;
+                        pGeneid.Value = geneid;
+                        updCmd.ExecuteNonQuery();
 
                         if (console == null) Globals.CursorStatus(iter, msg);
                         iter++;
@@ -681,10 +739,37 @@ public class HyperSqlObjectGene : HyperSqlObject
             while (reader.Read()) rows.Add((reader.GetString(0), reader.GetString(1), reader.GetInt32(2)));
             reader.Close();
 
+            // The column being written is per-tag (can't be parameterized), but
+            // rows are already ORDER BY tag, geneid, so one reused parameterized
+            // command per contiguous tag-run replaces a fresh command+SQL text
+            // per row while still setting the right column for each tag.
             using var tx = conn.BeginTransaction();
-            foreach (var (tag, geneid, sum) in rows)
+            SqliteCommand? updCmd = null;
+            SqliteParameter? pSum = null;
+            SqliteParameter? pGeneid = null;
+            string? curTag = null;
+            try
             {
-                Exec(conn, $"UPDATE geneResults SET {tag}_numSpecsAdj = {sum} WHERE geneid = '{geneid}'");
+                foreach (var (tag, geneid, sum) in rows)
+                {
+                    if (tag != curTag)
+                    {
+                        updCmd?.Dispose();
+                        updCmd = conn.CreateCommand();
+                        updCmd.Transaction = tx;
+                        updCmd.CommandText = $"UPDATE geneResults SET {tag}_numSpecsAdj = @sum WHERE geneid = @geneid";
+                        pSum = updCmd.Parameters.Add("@sum", SqliteType.Integer);
+                        pGeneid = updCmd.Parameters.Add("@geneid", SqliteType.Text);
+                        curTag = tag;
+                    }
+                    pSum!.Value = sum;
+                    pGeneid!.Value = geneid;
+                    updCmd!.ExecuteNonQuery();
+                }
+            }
+            finally
+            {
+                updCmd?.Dispose();
             }
             tx.Commit();
         }
@@ -823,15 +908,25 @@ public class HyperSqlObjectGene : HyperSqlObject
                     var protLen = reader.GetDouble(1);
                     lenRows.Add((reader.GetString(0), reader.GetDouble(2) / protLen, reader.GetDouble(3) / protLen, reader.GetDouble(4) / protLen));
                 }
-                using (var tx = conn.BeginTransaction())
+                using (var updCmd = conn.CreateCommand())
                 {
+                    updCmd.CommandText = $"""
+                        UPDATE nsaf_p1
+                          SET {tag}_specsTot = @tot, {tag}_specsUniq = @uniq, {tag}_specsAdj = @adj
+                        WHERE geneid = @geneid
+                        """;
+                    var pTot = updCmd.Parameters.Add("@tot", SqliteType.Real);
+                    var pUniq = updCmd.Parameters.Add("@uniq", SqliteType.Real);
+                    var pAdj = updCmd.Parameters.Add("@adj", SqliteType.Real);
+                    var pGeneid = updCmd.Parameters.Add("@geneid", SqliteType.Text);
+                    using var tx = BeginTransaction(conn, updCmd);
                     foreach (var (geneid, tot, uniq, adj) in lenRows)
                     {
-                        Exec(conn, $"""
-                            UPDATE nsaf_p1
-                              SET {tag}_specsTot = {tot}, {tag}_specsUniq = {uniq}, {tag}_specsAdj = {adj}
-                            WHERE geneid = '{geneid}'
-                            """);
+                        pTot.Value = tot;
+                        pUniq.Value = uniq;
+                        pAdj.Value = adj;
+                        pGeneid.Value = geneid;
+                        updCmd.ExecuteNonQuery();
                     }
                     tx.Commit();
                 }
@@ -850,19 +945,25 @@ public class HyperSqlObjectGene : HyperSqlObject
             {
                 var nsafRows = new List<(string geneid, double t, double u, double a)>();
                 while (reader.Read()) nsafRows.Add((reader.GetString(0), reader.GetDouble(1), reader.GetDouble(2), reader.GetDouble(3)));
-                using (var tx = conn.BeginTransaction())
+                using (var updCmd = conn.CreateCommand())
                 {
+                    updCmd.CommandText = $"""
+                        UPDATE nsaf
+                          SET {tag}_totNSAF = @totNsaf, {tag}_uniqNSAF = @uniqNsaf, {tag}_adjNSAF = @adjNsaf
+                        WHERE geneid = @geneid
+                        """;
+                    var pTotNsaf = updCmd.Parameters.Add("@totNsaf", SqliteType.Real);
+                    var pUniqNsaf = updCmd.Parameters.Add("@uniqNsaf", SqliteType.Real);
+                    var pAdjNsaf = updCmd.Parameters.Add("@adjNsaf", SqliteType.Real);
+                    var pGeneid = updCmd.Parameters.Add("@geneid", SqliteType.Text);
+                    using var tx = BeginTransaction(conn, updCmd);
                     foreach (var (geneid, xT, xU, xA) in nsafRows)
                     {
-                        var nsafT = totSum == 0 ? 0 : (xT / totSum) * nsafFactor;
-                        var nsafU = uniqSum == 0 ? 0 : (xU / uniqSum) * nsafFactor;
-                        var nsafA = adjSum == 0 ? 0 : (xA / adjSum) * nsafFactor;
-
-                        Exec(conn, $"""
-                            UPDATE nsaf
-                              SET {tag}_totNSAF = {nsafT}, {tag}_uniqNSAF = {nsafU}, {tag}_adjNSAF = {nsafA}
-                            WHERE geneid = '{geneid}'
-                            """);
+                        pTotNsaf.Value = totSum == 0 ? 0 : (xT / totSum) * nsafFactor;
+                        pUniqNsaf.Value = uniqSum == 0 ? 0 : (xU / uniqSum) * nsafFactor;
+                        pAdjNsaf.Value = adjSum == 0 ? 0 : (xA / adjSum) * nsafFactor;
+                        pGeneid.Value = geneid;
+                        updCmd.ExecuteNonQuery();
                     }
                     tx.Commit();
                 }

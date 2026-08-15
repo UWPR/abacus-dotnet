@@ -1021,6 +1021,55 @@ public class HyperSqlObject
             var pMaxIniProbUniq = cmd.Parameters.Add("@maxIniProbUniq", SqliteType.Real);
             var pProtid = cmd.Parameters.Add("@protid", SqliteType.Text);
 
+            // Precompute every protid's peptide/spectra statistics via a single
+            // aggregate query instead of calling RetNumPeps/RetNumSpectra/
+            // RetMaxIniProb/RetWtMaxIniProb (7 separate SQL round trips) once
+            // per protein below - that was an O(N x 7) query-execution pattern
+            // for ~N proteins that's algorithmically unnecessary: all four
+            // helpers only ever aggregate prot2peps_combined rows for a single
+            // protid, so one GROUP BY pass over the whole table computes every
+            // protid's answer at once. Faithfully reproduces each helper's exact
+            // filter semantics (including RetNumSpectra's iniProb parameter
+            // going unused - see those methods below) and the "0/0.0 if no rows
+            // matched" behavior ExecScalarInt/ExecScalarDouble give a bare
+            // scalar query with an empty result (ExecuteScalar() returning
+            // null/DBNull), for protids with zero rows in prot2peps_combined.
+            var statsByProtid = new Dictionary<string, (int numPepsTot, int numPepsUniq, int numSpecsTot, int numSpecsUniq, double maxIniProb, double wtMaxIniProb, double maxIniProbUniq)>();
+            using (var statsCmd = conn.CreateCommand())
+            {
+                statsCmd.CommandText = $"""
+                    WITH agg AS (
+                      SELECT protid,
+                        COUNT(DISTINCT CASE WHEN wt >= 0 AND iniProb >= {IniProbTh} THEN modPeptide || char(30) || charge END) AS numPepsTot,
+                        COUNT(DISTINCT CASE WHEN wt >= {WtTh} AND iniProb >= {IniProbTh} THEN modPeptide || char(30) || charge END) AS numPepsUniq,
+                        SUM(CASE WHEN wt >= 0 THEN nspecs END) AS numSpecsTot,
+                        SUM(CASE WHEN wt >= {WtTh} THEN nspecs END) AS numSpecsUniq,
+                        MAX(iniProb) AS maxIniProb,
+                        MAX(CASE WHEN wt >= {WtTh} THEN iniProb END) AS maxIniProbUniq
+                      FROM prot2peps_combined
+                      GROUP BY protid
+                    )
+                    SELECT agg.protid, agg.numPepsTot, agg.numPepsUniq, agg.numSpecsTot, agg.numSpecsUniq,
+                           agg.maxIniProb, agg.maxIniProbUniq,
+                           (SELECT MAX(p2.wt) FROM prot2peps_combined AS p2
+                            WHERE p2.protid = agg.protid AND p2.iniProb = agg.maxIniProb) AS wtMaxIniProb
+                    FROM agg
+                    """;
+                using var statsReader = statsCmd.ExecuteReader();
+                while (statsReader.Read())
+                {
+                    statsByProtid[statsReader.GetString(0)] = (
+                        statsReader.IsDBNull(1) ? 0 : statsReader.GetInt32(1),
+                        statsReader.IsDBNull(2) ? 0 : statsReader.GetInt32(2),
+                        statsReader.IsDBNull(3) ? 0 : statsReader.GetInt32(3),
+                        statsReader.IsDBNull(4) ? 0 : statsReader.GetInt32(4),
+                        statsReader.IsDBNull(5) ? 0.0 : statsReader.GetDouble(5),
+                        statsReader.IsDBNull(7) ? 0.0 : statsReader.GetDouble(7),
+                        statsReader.IsDBNull(6) ? 0.0 : statsReader.GetDouble(6));
+                }
+            }
+            var zeroStats = (numPepsTot: 0, numPepsUniq: 0, numSpecsTot: 0, numSpecsUniq: 0, maxIniProb: 0.0, wtMaxIniProb: 0.0, maxIniProbUniq: 0.0);
+
             using var reader = ExecuteReader(conn, "SELECT protid, numXML, maxPw FROM t3_ WHERE numXML > 0 GROUP BY protid, numXML, maxPw ORDER BY protid");
             console?.MonitorBoxInit(n3, "Building Heuristics (2/2)...");
             var iter = 0;
@@ -1028,22 +1077,15 @@ public class HyperSqlObject
             while (reader.Read())
             {
                 var protid = reader.GetString(0);
+                var stats = statsByProtid.TryGetValue(protid, out var s) ? s : zeroStats;
 
-                var numPepsTot = RetNumPeps(conn, CombinedFile!, protid, 0, IniProbTh);
-                var numPepsUniq = RetNumPeps(conn, CombinedFile!, protid, WtTh, IniProbTh);
-                var numSpecsTot = RetNumSpectra(conn, CombinedFile!, protid, 0, IniProbTh);
-                var numSpecsUniq = RetNumSpectra(conn, CombinedFile!, protid, WtTh, IniProbTh);
-                var maxIniProb = RetMaxIniProb(conn, CombinedFile!, protid, 0);
-                var wtMaxIniProb = RetWtMaxIniProb(conn, CombinedFile!, protid, maxIniProb);
-                var maxIniProbUniq = RetMaxIniProb(conn, CombinedFile!, protid, WtTh);
-
-                pNumPepsTot.Value = numPepsTot;
-                pNumPepsUniq.Value = numPepsUniq;
-                pNumSpecsTot.Value = numSpecsTot;
-                pNumSpecsUniq.Value = numSpecsUniq;
-                pMaxIniProb.Value = maxIniProb;
-                pWtMaxIniProb.Value = wtMaxIniProb;
-                pMaxIniProbUniq.Value = maxIniProbUniq;
+                pNumPepsTot.Value = stats.numPepsTot;
+                pNumPepsUniq.Value = stats.numPepsUniq;
+                pNumSpecsTot.Value = stats.numSpecsTot;
+                pNumSpecsUniq.Value = stats.numSpecsUniq;
+                pMaxIniProb.Value = stats.maxIniProb;
+                pWtMaxIniProb.Value = stats.wtMaxIniProb;
+                pMaxIniProbUniq.Value = stats.maxIniProbUniq;
                 pProtid.Value = protid;
                 cmd.ExecuteNonQuery();
 
@@ -1093,36 +1135,75 @@ public class HyperSqlObject
 
             if (console != null) console.MonitorBoxInit(n4, "  Loading protidSummary table...");
 
+            using var selCmd = conn.CreateCommand();
+            selCmd.CommandText = $"""
+                SELECT protid, numXML, maxPw, numPepsTot, numPepsUniq,
+                  numSpecsTot, numSpecsUniq, maxIniProb, wt_maxIniProb,
+                  maxIniProbUniq
+                FROM t3_
+                WHERE groupid = @gid
+                AND siblingGroup = @sib
+                AND maxIniProb >= {MaxIniProbTh}
+                GROUP BY protid, numXML, maxPw, numPepsTot, numPepsUniq,
+                  numSpecsTot, numSpecsUniq, maxIniProb, wt_maxIniProb,
+                  maxIniProbUniq
+                ORDER BY numXML DESC, maxPw DESC, maxIniProb DESC,
+                  maxIniProbUniq DESC, numPepsUniq DESC, numSpecsUniq DESC, protid ASC
+                LIMIT 1
+                """;
+            var pSelGid = selCmd.Parameters.Add("@gid", SqliteType.Integer);
+            var pSelSib = selCmd.Parameters.Add("@sib", SqliteType.Text);
+
+            using var insCmd = conn.CreateCommand();
+            insCmd.CommandText = """
+                INSERT INTO protidSummary VALUES
+                  (@gid,@sib,@protid,@numXml,@maxPw,@numPepsTot,@numPepsUniq,
+                   @numSpecsTot,@numSpecsUniq,@maxIniProb,@wtMaxIniProb,@maxIniProbUniq)
+                """;
+            var pInsGid = insCmd.Parameters.Add("@gid", SqliteType.Integer);
+            var pInsSib = insCmd.Parameters.Add("@sib", SqliteType.Text);
+            var pProtid = insCmd.Parameters.Add("@protid", SqliteType.Text);
+            var pNumXml = insCmd.Parameters.Add("@numXml", SqliteType.Integer);
+            var pMaxPw = insCmd.Parameters.Add("@maxPw", SqliteType.Real);
+            var pInsNumPepsTot = insCmd.Parameters.Add("@numPepsTot", SqliteType.Integer);
+            var pInsNumPepsUniq = insCmd.Parameters.Add("@numPepsUniq", SqliteType.Integer);
+            var pInsNumSpecsTot = insCmd.Parameters.Add("@numSpecsTot", SqliteType.Integer);
+            var pInsNumSpecsUniq = insCmd.Parameters.Add("@numSpecsUniq", SqliteType.Integer);
+            var pInsMaxIniProb = insCmd.Parameters.Add("@maxIniProb", SqliteType.Real);
+            var pInsWtMaxIniProb = insCmd.Parameters.Add("@wtMaxIniProb", SqliteType.Real);
+            var pInsMaxIniProbUniq = insCmd.Parameters.Add("@maxIniProbUniq", SqliteType.Real);
+
+            using var tx = BeginTransaction(conn, selCmd, insCmd);
             var iter = 0;
             foreach (var (gid, sib) in groups)
             {
-                using var reader2 = ExecuteReader(conn, $"""
-                    SELECT protid, numXML, maxPw, numPepsTot, numPepsUniq,
-                      numSpecsTot, numSpecsUniq, maxIniProb, wt_maxIniProb,
-                      maxIniProbUniq
-                    FROM t3_
-                    WHERE groupid = {gid}
-                    AND siblingGroup = '{sib}'
-                    AND maxIniProb >= {MaxIniProbTh}
-                    GROUP BY protid, numXML, maxPw, numPepsTot, numPepsUniq,
-                      numSpecsTot, numSpecsUniq, maxIniProb, wt_maxIniProb,
-                      maxIniProbUniq
-                    ORDER BY numXML DESC, maxPw DESC, maxIniProb DESC,
-                      maxIniProbUniq DESC, numPepsUniq DESC, numSpecsUniq DESC, protid ASC
-                    LIMIT 1
-                    """);
-                while (reader2.Read())
+                pSelGid.Value = gid;
+                pSelSib.Value = sib;
+                using (var reader2 = selCmd.ExecuteReader())
                 {
-                    Exec(conn, "INSERT INTO protidSummary VALUES ("
-                        + $"{gid}, '{sib}', '{reader2.GetString(0)}', {reader2.GetInt32(1)}, {reader2.GetDouble(2)}, "
-                        + $"{reader2.GetInt32(3)}, {reader2.GetInt32(4)}, {reader2.GetInt32(5)}, {reader2.GetInt32(6)}, "
-                        + $"{reader2.GetDouble(7)}, {reader2.GetDouble(8)}, {reader2.GetDouble(9)})");
+                    while (reader2.Read())
+                    {
+                        pInsGid.Value = gid;
+                        pInsSib.Value = sib;
+                        pProtid.Value = reader2.GetString(0);
+                        pNumXml.Value = reader2.GetInt32(1);
+                        pMaxPw.Value = reader2.GetDouble(2);
+                        pInsNumPepsTot.Value = reader2.GetInt32(3);
+                        pInsNumPepsUniq.Value = reader2.GetInt32(4);
+                        pInsNumSpecsTot.Value = reader2.GetInt32(5);
+                        pInsNumSpecsUniq.Value = reader2.GetInt32(6);
+                        pInsMaxIniProb.Value = reader2.GetDouble(7);
+                        pInsWtMaxIniProb.Value = reader2.GetDouble(8);
+                        pInsMaxIniProbUniq.Value = reader2.GetDouble(9);
+                        insCmd.ExecuteNonQuery();
+                    }
                 }
                 iter++;
 
                 if (console != null) console.MonitorBoxUpdate(iter);
                 else Globals.CursorStatus(iter, "  Loading protidSummary table...");
             }
+            tx.Commit();
         }
 
         Exec(conn, "CREATE INDEX ps_idx1 ON protidSummary(groupid, siblingGroup)");
@@ -2063,17 +2144,27 @@ public class HyperSqlObject
                     var protLen = reader.GetDouble(1);
                     lenRows.Add((reader.GetString(0), reader.GetDouble(2) / protLen, reader.GetDouble(3) / protLen, reader.GetDouble(4) / protLen));
                 }
-                using (var tx = conn.BeginTransaction())
+                using (var updCmd = conn.CreateCommand())
                 {
+                    updCmd.CommandText = $"""
+                        UPDATE nsaf_p1
+                          SET {tag}_specsTot = @tot,
+                              {tag}_specsUniq = @uniq,
+                              {tag}_specsAdj = @adj
+                        WHERE protid = @protid
+                        """;
+                    var pTot = updCmd.Parameters.Add("@tot", SqliteType.Real);
+                    var pUniq = updCmd.Parameters.Add("@uniq", SqliteType.Real);
+                    var pAdj = updCmd.Parameters.Add("@adj", SqliteType.Real);
+                    var pProtid = updCmd.Parameters.Add("@protid", SqliteType.Text);
+                    using var tx = BeginTransaction(conn, updCmd);
                     foreach (var (protid, tot, uniq, adj) in lenRows)
                     {
-                        Exec(conn, $"""
-                            UPDATE nsaf_p1
-                              SET {tag}_specsTot = {tot},
-                                  {tag}_specsUniq = {uniq},
-                                  {tag}_specsAdj = {adj}
-                            WHERE protid = '{protid}'
-                            """);
+                        pTot.Value = tot;
+                        pUniq.Value = uniq;
+                        pAdj.Value = adj;
+                        pProtid.Value = protid;
+                        updCmd.ExecuteNonQuery();
                     }
                     tx.Commit();
                 }
@@ -2092,21 +2183,27 @@ public class HyperSqlObject
             {
                 var nsafRows = new List<(string protid, double t, double u, double a)>();
                 while (reader.Read()) nsafRows.Add((reader.GetString(0), reader.GetDouble(1), reader.GetDouble(2), reader.GetDouble(3)));
-                using (var tx = conn.BeginTransaction())
+                using (var updCmd = conn.CreateCommand())
                 {
+                    updCmd.CommandText = $"""
+                        UPDATE nsaf
+                          SET {tag}_totNSAF = @totNsaf,
+                              {tag}_uniqNSAF = @uniqNsaf,
+                              {tag}_adjNSAF = @adjNsaf
+                        WHERE protid = @protid
+                        """;
+                    var pTotNsaf = updCmd.Parameters.Add("@totNsaf", SqliteType.Real);
+                    var pUniqNsaf = updCmd.Parameters.Add("@uniqNsaf", SqliteType.Real);
+                    var pAdjNsaf = updCmd.Parameters.Add("@adjNsaf", SqliteType.Real);
+                    var pProtid = updCmd.Parameters.Add("@protid", SqliteType.Text);
+                    using var tx = BeginTransaction(conn, updCmd);
                     foreach (var (protid, xT, xU, xA) in nsafRows)
                     {
-                        var nsafT = totSum == 0 ? 0 : (xT / totSum) * nsafFactor;
-                        var nsafU = uniqSum == 0 ? 0 : (xU / uniqSum) * nsafFactor;
-                        var nsafA = adjSum == 0 ? 0 : (xA / adjSum) * nsafFactor;
-
-                        Exec(conn, $"""
-                            UPDATE nsaf
-                              SET {tag}_totNSAF = {nsafT},
-                                  {tag}_uniqNSAF = {nsafU},
-                                  {tag}_adjNSAF = {nsafA}
-                            WHERE protid = '{protid}'
-                            """);
+                        pTotNsaf.Value = totSum == 0 ? 0 : (xT / totSum) * nsafFactor;
+                        pUniqNsaf.Value = uniqSum == 0 ? 0 : (xU / uniqSum) * nsafFactor;
+                        pAdjNsaf.Value = adjSum == 0 ? 0 : (xA / adjSum) * nsafFactor;
+                        pProtid.Value = protid;
+                        updCmd.ExecuteNonQuery();
                     }
                     tx.Commit();
                 }

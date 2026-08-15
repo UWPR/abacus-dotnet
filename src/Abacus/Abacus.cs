@@ -88,6 +88,27 @@ public class Abacus
             conn = new SqliteConnection(connectionString);
             conn.Open();
 
+            // WAL + synchronous=NORMAL is the standard low-overhead-but-still-
+            // crash-safe combo: it avoids a full fsync-safe rollback-journal
+            // write on every transaction commit (the default journal_mode=DELETE
+            // + synchronous=FULL), which matters a lot for keepDB=true's on-disk
+            // database given how many separate batched transactions the pipeline
+            // commits. A no-op for the default :memory: database - SQLite always
+            // uses its "memory" journal mode there regardless of this pragma.
+            //
+            // temp_store=MEMORY matters for *both* modes, including the default
+            // :memory: one: SQLite's default temp_store (0, "compile-time
+            // default") resolves to file-based temp storage for the scratch
+            // B-trees ORDER BY/GROUP BY/CREATE INDEX/DISTINCT spill to when they
+            // don't fit in the in-memory sort buffer - meaning a "fully
+            // in-memory" run was still doing real disk I/O for every one of the
+            // pipeline's many sorts and index builds unless this is set.
+            using (var pragmaCmd = conn.CreateCommand())
+            {
+                pragmaCmd.CommandText = "PRAGMA journal_mode=WAL; PRAGMA synchronous=NORMAL; PRAGMA temp_store=MEMORY;";
+                pragmaCmd.ExecuteNonQuery();
+            }
+
             if (!Globals.ByPeptide)
             {
                 LoadProtXml(conn, null);

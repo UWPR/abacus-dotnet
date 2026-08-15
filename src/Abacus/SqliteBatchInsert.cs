@@ -19,14 +19,29 @@ public sealed class SqliteBatchInsert : IBatchInsert, IDisposable
     private readonly SqliteConnection connection;
     private readonly string insertSql;
     private readonly int parameterCount;
-    private readonly Dictionary<int, object?> current = new();
-    private readonly List<Dictionary<int, object?>> queued = new();
+
+    // 1-based, index 0 unused - matches the Set*(index, ...) call sites'
+    // 1-based JDBC-style parameter indices exactly, so no +/-1 translation
+    // is needed anywhere. Array-backed instead of the original
+    // Dictionary<int, object?>: this is on the hottest path in the whole
+    // port (called once per peptide row while parsing every protXML/pepXML
+    // file - millions of times across a real run), and a dictionary clone
+    // (hash + bucket allocation) per row was measurably expensive purely as
+    // allocation/GC pressure, not I/O. Both current call sites
+    // (ProtXml.WriteToDb, PepXml's insert path) always set every index
+    // 1..parameterCount before calling AddBatch(), but current is explicitly
+    // cleared after each snapshot anyway so a caller that *doesn't* would
+    // still see the original "unset index -> DBNull" behavior instead of a
+    // stale value bleeding through from the previous row.
+    private readonly object?[] current;
+    private readonly List<object?[]> queued = new();
 
     public SqliteBatchInsert(SqliteConnection connection, string insertSql, int parameterCount)
     {
         this.connection = connection;
         this.insertSql = insertSql;
         this.parameterCount = parameterCount;
+        current = new object?[parameterCount + 1];
     }
 
     public void SetString(int index, string? value) => current[index] = value;
@@ -35,7 +50,8 @@ public sealed class SqliteBatchInsert : IBatchInsert, IDisposable
 
     public void AddBatch()
     {
-        queued.Add(new Dictionary<int, object?>(current));
+        queued.Add((object?[])current.Clone());
+        Array.Clear(current);
     }
 
     /// <summary>Equivalent to `prep.executeBatch()`: replays all queued rows in one transaction.</summary>
@@ -48,16 +64,21 @@ public sealed class SqliteBatchInsert : IBatchInsert, IDisposable
         cmd.Transaction = transaction;
         cmd.CommandText = insertSql;
 
+        // Capture parameter *references* once instead of looking each one up
+        // by name (`cmd.Parameters[$"@p{i}"]`, allocating a fresh string and
+        // doing a name-based lookup) inside the per-row loop below.
+        var parameters = new SqliteParameter[parameterCount + 1];
         for (var i = 1; i <= parameterCount; i++)
         {
-            cmd.Parameters.Add(new SqliteParameter($"@p{i}", DBNull.Value));
+            parameters[i] = new SqliteParameter($"@p{i}", DBNull.Value);
+            cmd.Parameters.Add(parameters[i]);
         }
 
         foreach (var row in queued)
         {
             for (var i = 1; i <= parameterCount; i++)
             {
-                cmd.Parameters[$"@p{i}"].Value = row.TryGetValue(i, out var v) && v != null ? v : DBNull.Value;
+                parameters[i].Value = row[i] ?? DBNull.Value;
             }
             cmd.ExecuteNonQuery();
         }

@@ -234,6 +234,104 @@ position: all 76 x 2651 = 201,476 cells matched exactly. No Java `keepDB=true` t
 (only Java's default-mode runtime was benchmarked) - not expected to matter, since `keepDB` only changes where
 SQLite writes, not query logic, in either language.
 
+### Algorithmic and I/O-overhead fixes (2026-08-14)
+
+With transaction batching in place, `keepDB=true` completed rather than hanging, but was still ~5x slower than
+`keepDB=false` (~20 min vs. ~2 min) on the production dataset. A follow-up code review specifically looking for
+further speed opportunities (not correctness issues - the port was already exact-match verified) found three
+tiers of fixes, in descending order of how much each mattered in practice:
+
+- **Algorithmic (N+1 query pattern)**: `MakeProtidSummary`'s "Building Heuristics (2/2)" loop called
+  `RetNumPeps`/`RetNumSpectra`/`RetMaxIniProb`/`RetWtMaxIniProb` - 7 separate SQL round trips - once per protein
+  (~18K query executions for ~2.6K proteins). Rewritten as a single `GROUP BY protid` aggregate query (a CTE plus
+  one correlated subquery for `wtMaxIniProb`, which depends on the per-protid `maxIniProb` computed in the same
+  pass) executed once, cached in a `Dictionary<protid, stats>`, looked up per row instead of recomputed. Faithfully
+  reproduces each original helper's exact filter semantics, including `RetNumSpectra`'s `iniProb` parameter going
+  unused (preserved as-is, not "fixed") and the 0/0.0-if-no-matching-rows behavior `ExecScalarInt`/`ExecScalarDouble`
+  give a NULL scalar result. **Honest result**: measured impact on `keepDB=false` was within noise (~114.5s ->
+  ~112.7s CPU time, ~1.4%) - SQLite serves repeated small queries against an in-memory B-tree cheaply regardless of
+  round-trip count, so eliminating the round trips mostly saves ADO.NET/SQL-parse overhead, not I/O wait. Kept
+  anyway since it's strictly better and cost nothing in complexity.
+- **Parameterized-command reuse**: ~10 more loop sites across `HyperSqlObject.cs`/`HyperSqlObjectGene.cs`
+  (`GetNsafValuesProt`/`GetNsafValuesGene`'s per-protein/gene update loops, `MakeProtidSummary`'s `protidSummary`
+  insert loop, `MakeGeneidSummary`, `AppendIndividualExptsGc`'s two loops, and a per-`(tag,geneid)` `DELETE` loop
+  in the gene-exclusion-table builder) converted from `Exec(conn, $"...")` - a brand-new SQL string with inlined
+  literal values plus a brand-new `SqliteCommand` every row, forcing SQLite to reparse/replan on every single
+  execution - to a single prepared `SqliteCommand` created once with bound parameters rebound per row, matching
+  the pattern `MakeProtXmlTable`'s ~2.9M-row population loop and `MakePepUsageTable` already used correctly.
+  Several methods initially suspected of the same problem (`ReformatResults`, `MakeWt9XgroupsTable`, `CleanUp`,
+  `MergeIdFields`) turned out on inspection to already be efficient per-*tag* (a handful of iterations, not
+  per-row) loops of already-set-based statements - false positives from a `grep`-only first pass, correctly ruled
+  out before touching any code. One genuine bonus find along the way: `MakeProtidSummary`'s `protidSummary` INSERT
+  loop had no transaction wrap at all, missed by both earlier transaction-batching audit passes.
+- **SQLite PRAGMA tuning**: added `PRAGMA journal_mode=WAL; PRAGMA synchronous=NORMAL;` immediately after
+  `conn.Open()` in `Abacus.cs`. A no-op for the default `:memory:` database (SQLite always uses its "memory"
+  journal mode there regardless of this pragma), but for `keepDB=true` this was **the dominant win** of the three:
+  it avoids a full fsync-safe rollback-journal write on every one of the pipeline's many transaction commits, in
+  favor of a WAL append plus a periodic checkpoint. WAL+NORMAL is the standard safe-but-fast combo (crash-safe,
+  just not durable against OS-level power loss mid-write, which doesn't matter for a scratch analysis database).
+
+**Verified end-to-end (2026-08-14)**: re-ran both modes against the same real 6-experiment production dataset
+after all three fixes, each diffed against `ABACUS_output.tsv` the same way as before - exact match, 0
+mismatches across all 201,476 cells, in both modes. 30/30 unit tests passing throughout.
+
+| | `keepDB=false` | `keepDB=true` |
+|---|---|---|
+| Before this pass | 114.5s CPU, 3.6 GB peak RSS, 2:11 wall | ~20:07 total runtime |
+| After this pass | 111.8s CPU, 2.98 GB peak RSS, 2:07.50 wall | 3:57.85 wall (**~5x faster**), 1.15 GB peak RSS |
+
+`keepDB=true` remains slower than `keepDB=false` (disk writes are still disk writes), but the gap shrank from
+~10x to under 2x, making disk mode - previously painful enough to avoid unless necessary - now practical for
+routine use whenever inspecting intermediate tables after a run is useful (see the README/user-facing docs for
+when that's worth doing).
+
+### `keepDB=false` speed investigation (2026-08-14)
+
+The fixes above barely moved `keepDB=false`'s runtime, which made sense once measured directly: a live run
+piped through per-line timestamps (`ts`) to find real stage boundaries showed the code touched by the fixes
+above was only ~5% of `keepDB=false`'s total time. The actual breakdown on the production dataset (~126s
+total): protXML parsing 31.0%, building the protXML table (2.9M rows) 24.9%, mapping peptides to proteins
+10.7%, pepXML parsing 10.1%, indexing the protXML table 9.6%, building the combined table 6.0% - XML parsing
+(41.1%) and protXML table build+index (34.5%) dominate, not the smaller per-protein loops fixed earlier.
+
+Two fixes came out of chasing those two categories:
+
+- **`PRAGMA temp_store=MEMORY`** (added to the same pragma block as the `keepDB=true` fixes above): SQLite's
+  default `temp_store` (`0`, "compile-time default") resolves to file-based temp storage for the scratch
+  B-trees `ORDER BY`/`GROUP BY`/`CREATE INDEX`/`DISTINCT` spill to - meaning the *default* `:memory:` run was
+  still doing real disk I/O for its many sorts and index builds. Measured impact was modest (system/kernel time
+  dropped ~28%, from 14.18s to 10.23s, confirming real I/O was eliminated, but total CPU barely moved) - kept
+  anyway since it's a free, zero-downside win.
+- **`SqliteBatchInsert` rewrite**: this class is what every parsed protXML/pepXML row funnels through (the
+  `IBatchInsert prep` used by `ProtXml.WriteToDb` and the equivalent pepXML path), so it's on the hottest path
+  in the whole port - called millions of times across a real run. It had two real inefficiencies: `AddBatch()`
+  cloned a full `Dictionary<int, object?>` per row (hash + bucket allocation every single call), and
+  `ExecuteBatch()` looked up each `SqliteParameter` by name (`cmd.Parameters[$"@p{i}"]`, allocating a fresh
+  string) inside its per-row replay loop instead of once. Rewritten to array-backed storage (1-based, matching
+  the existing `Set*(index, ...)` call convention exactly) and pre-captured parameter references, with
+  `current` explicitly cleared after each `AddBatch()` snapshot so an unset index still falls through to
+  `DBNull` (matching the original dictionary's "key not present" behavior) rather than silently reusing a
+  stale value from the previous row. **Not exercised by the unit test suite** - it uses `FakeBatchInsert`
+  instead - so this was only validated by a real end-to-end production run, the first time this class's new
+  code path actually ran.
+
+**Verified (2026-08-14)**: both changes together, re-run against the same real 6-experiment production
+dataset, diffed against `ABACUS_output.tsv` the same way as every prior pass - exact match, 0 mismatches
+across all 201,476 cells. 30/30 unit tests passing (though, per the note above, that doesn't cover
+`SqliteBatchInsert` itself - only the real-data diff does).
+
+| | CPU | Wall clock | Peak RSS |
+|---|---|---|---|
+| Before | 111.8s | 2:07.50 | 2.98 GB |
+| After (temp_store + SqliteBatchInsert rewrite) | 104.95s | 2:02.09 | 3.00 GB |
+
+About 6% faster - real, but modest compared to the `keepDB=true` win above. Most of the 41%-of-runtime XML
+parsing cost looks inherent to streaming XML traversal and per-field string allocation, not further-fixable
+overhead; the protXML-vs-pepXML per-byte parsing speed gap (protXML: ~50 MB/s vs pepXML: ~100 MB/s) most
+likely reflects protXML's more deeply nested/verbose element structure rather than a port inefficiency, but
+this wasn't dug into further. `SqliteBatchInsert` is used identically regardless of `keepDB`, so this fix
+should help `keepDB=true` too, though that wasn't separately re-measured.
+
 ## Commands
 
 ```
